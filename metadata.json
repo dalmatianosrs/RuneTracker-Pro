@@ -1,0 +1,5 @@
+{
+  "name": "RS3 Progress Tracker",
+  "description": "A comprehensive RuneScape 3 player stats tracker with real-time XP progress calculations, historical gain tracking via local storage, and interactive data visualizations.",
+  "requestFramePermissions": []
+}
