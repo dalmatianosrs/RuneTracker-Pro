@@ -1,4 +1,5 @@
 
+// Import React hooks and types to resolve compilation errors
 import React, { useState, useMemo } from 'react';
 import { rsService } from './services/rsService';
 import { cmlService } from './services/cmlService';
@@ -80,12 +81,20 @@ const App: React.FC = () => {
     if (!cmlGains?.isAvailable) return [];
     return Object.entries(cmlGains['7d'])
       .map(([id, gain]) => ({ id: parseInt(id), gain: gain as number }))
+      .filter(g => g.id !== -1 && g.gain > 0) // Exclude "Overall" and zero gains
       .sort((a, b) => b.gain - a.gain)
-      .filter(g => g.gain > 0)
       .slice(0, 3);
   }, [cmlGains]);
 
   const isStorageError = error?.startsWith('STORAGE_FULL');
+
+  // Helper to format rank safely
+  const formatRank = (rank: string | number) => {
+    if (!rank) return '---';
+    const cleanRank = typeof rank === 'string' ? rank.replace(/,/g, '') : rank;
+    const num = Number(cleanRank);
+    return isNaN(num) ? rank.toString() : num.toLocaleString();
+  };
 
   return (
     <div className="min-h-screen bg-[#0a0a0c] text-slate-200">
@@ -134,7 +143,7 @@ const App: React.FC = () => {
                   <div className="flex flex-wrap gap-4 text-sm font-bold text-slate-500">
                     <div className="flex items-center gap-1.5"><span className="text-sky-500">LVL</span> {profile.totalskill} Total</div>
                     <div className="flex items-center gap-1.5"><span className="text-red-500">CMB</span> {profile.combatlevel} Combat</div>
-                    <div className="flex items-center gap-1.5"><span className="text-amber-500">RANK</span> {Number(profile.rank).toLocaleString()} Global</div>
+                    <div className="flex items-center gap-1.5"><span className="text-amber-500">RANK</span> {formatRank(profile.rank)} Global</div>
                   </div>
                </div>
 
@@ -171,7 +180,7 @@ const App: React.FC = () => {
                   <div className="space-y-3">
                     {topGains.length > 0 ? topGains.map(g => (
                       <div key={g.id} className="bg-[#121214] p-3 rounded-xl border border-[#222226] flex items-center justify-between group hover:border-emerald-500/30 transition-colors">
-                        <span className="text-sm font-bold text-white">{SKILL_DEFINITIONS[g.id]?.name}</span>
+                        <span className="text-sm font-bold text-white">{SKILL_DEFINITIONS[g.id]?.name || 'Unknown Skill'}</span>
                         <span className="text-sm font-black text-emerald-400">+{Math.floor(g.gain / 10).toLocaleString()}</span>
                       </div>
                     )) : (

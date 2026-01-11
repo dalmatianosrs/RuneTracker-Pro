@@ -1,21 +1,31 @@
 
 import { CmlGains } from '../types';
 
-const PRIMARY_PROXY = 'https://api.allorigins.win/get?url=';
-const FALLBACK_PROXY = 'https://api.codetabs.com/v1/proxy?quest=';
+const PROXIES = [
+  'https://api.allorigins.win/get?url=',
+  'https://api.codetabs.com/v1/proxy?quest=',
+  'https://corsproxy.io/?'
+];
+
 const CML_RS3_URL = 'https://crystalmathlabs.com/tracker-rs3/track.php?player=';
 
 /**
- * Mapping of CML skill names to our internal Skill IDs.
+ * IF THE STRUCTURE CHANGES:
+ * 1. Check NAME_TO_ID mapping. Ensure the names here match what CML displays.
+ * 2. Look for the main table ID. Currently CML uses 'trackertable'.
+ * 3. Check 'Header Indices' logic. CML uses keywords like '24h', '7d', '30d', '365d'.
  */
+
 const NAME_TO_ID: Record<string, number> = {
-  'Attack': 0, 'Defence': 1, 'Strength': 2, 'Constitution': 3, 'Ranged': 4,
-  'Prayer': 5, 'Magic': 6, 'Cooking': 7, 'Woodcutting': 8, 'Fletching': 9,
-  'Fishing': 10, 'Firemaking': 11, 'Crafting': 12, 'Smithing': 13, 'Mining': 14,
-  'Herblore': 15, 'Agility': 16, 'Thieving': 17, 'Slayer': 18, 'Farming': 19,
-  'Runecrafting': 20, 'Hunter': 21, 'Construction': 22, 'Summoning': 23,
-  'Dungeoneering': 24, 'Divination': 25, 'Invention': 26, 'Archaeology': 27, 
-  'Necromancy': 28, 'Overall': -1
+  'attack': 0, 'defence': 1, 'strength': 2, 'constitution': 3, 'hitpoints': 3, 'con': 3,
+  'ranged': 4, 'prayer': 5, 'magic': 6, 'cooking': 7, 'woodcutting': 8, 'wc': 8,
+  'fletching': 9, 'fishing': 10, 'firemaking': 11, 'fm': 11, 'crafting': 12,
+  'smithing': 13, 'mining': 14, 'herblore': 15, 'herb': 15, 'agility': 16,
+  'thieving': 17, 'slayer': 18, 'farming': 19, 'runecrafting': 20, 'rc': 20,
+  'hunter': 21, 'construction': 22, 'summoning': 23, 'summ': 23,
+  'dungeoneering': 24, 'dg': 24, 'dung': 24, 'divination': 25, 'div': 25,
+  'invention': 26, 'inv': 26, 'archaeology': 27, 'arch': 27, 'necromancy': 28, 'necro': 28,
+  'overall': -1, 'total': -1
 };
 
 export const cmlService = {
@@ -28,106 +38,152 @@ export const cmlService = {
     const targetUrl = `${CML_RS3_URL}${encodeURIComponent(rsn)}`;
 
     const tryScrape = async (proxyBase: string) => {
-      const response = await fetch(`${proxyBase}${encodeURIComponent(targetUrl)}`);
+      const fullUrl = `${proxyBase}${encodeURIComponent(targetUrl)}`;
+      const response = await fetch(fullUrl);
+      
       if (!response.ok) throw new Error(`Proxy status: ${response.status}`);
       
       const text = await response.text();
       let htmlString = '';
       
       try {
+        // AllOrigins and sometimes others wrap in JSON
         const json = JSON.parse(text);
         htmlString = json.contents || text;
       } catch (e) {
         htmlString = text;
       }
       
-      if (!htmlString || htmlString.includes('Player not found') || htmlString.includes('Invalid name')) {
+      if (!htmlString || htmlString.length < 500) {
+        throw new Error('PROXY_RETURNED_EMPTY_OR_SHORT');
+      }
+
+      if (htmlString.toLowerCase().includes('player not found') || htmlString.toLowerCase().includes('invalid name')) {
         throw new Error('NOT_TRACKED');
       }
 
+      // 1. Clean up HTML
+      const cleanHtml = htmlString
+        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
+        .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "")
+        .replace(/&nbsp;/g, " ")
+        .replace(/\s+/g, " ");
+
       const parser = new DOMParser();
-      const doc = parser.parseFromString(htmlString, 'text/html');
+      const doc = parser.parseFromString(cleanHtml, 'text/html');
       
-      // If we see an "Update" link but no stats, the player exists but CML hasn't indexed them yet.
-      const hasUpdateLink = Array.from(doc.querySelectorAll('a')).some(a => a.textContent?.toLowerCase().includes('update'));
+      const hasUpdateLink = Array.from(doc.querySelectorAll('a, button'))
+        .some(el => el.textContent?.toLowerCase().includes('update'));
 
-      /**
-       * ADVANCED TABLE DETECTION
-       * We iterate through all tables and "score" them based on how many skill names they contain.
-       * This is much more resilient than looking for specific headers.
-       */
-      const tables = doc.querySelectorAll('table');
-      let bestTable: HTMLTableElement | null = null;
+      // 2. Target the table
+      // Preference 1: Explicit ID
+      let statsTable = doc.getElementById('trackertable') as HTMLTableElement | null;
+      let skillColumnIndex = -1;
+      // Fixed: Define highestScore here so it's accessible to the check on line 126.
       let highestScore = 0;
-      let bestHeaderIndices: Record<string, number> = { skill: -1, day: -1, week: -1, month: -1, year: -1 };
 
-      for (const table of Array.from(tables)) {
-        const rows = Array.from(table.querySelectorAll('tr'));
-        if (rows.length < 5) continue; // Stats tables are long
+      // Preference 2: Best scoring table
+      if (!statsTable) {
+        const tables = Array.from(doc.querySelectorAll('table'));
 
-        let currentHeaderIndices = { skill: -1, day: -1, week: -1, month: -1, year: -1 };
-        let tableScore = 0;
+        for (const table of tables) {
+          const rows = Array.from(table.querySelectorAll('tr'));
+          if (rows.length < 5) continue;
 
-        // Try to find headers in the first 3 rows
-        for (let r = 0; r < Math.min(rows.length, 3); r++) {
-          const cells = Array.from(rows[r].querySelectorAll('th, td')).map(c => c.textContent?.trim().toLowerCase() || '');
-          
-          const sIdx = cells.findIndex(c => c.includes('skill') || c === 'name');
-          const dIdx = cells.findIndex(c => c.includes('day') || c.includes('24h'));
-          const wIdx = cells.findIndex(c => c.includes('week') || c.includes('7d'));
-          const mIdx = cells.findIndex(c => c.includes('month') || c.includes('30d'));
-          const yIdx = cells.findIndex(c => c.includes('year') || c.includes('365d'));
+          const uniqueSkillsFound = new Set<number>();
+          let localSkillColIdx = -1;
 
-          if (sIdx !== -1) {
-            currentHeaderIndices = { skill: sIdx, day: dIdx, week: wIdx, month: mIdx, year: yIdx };
-            break;
+          rows.forEach(row => {
+            const cells = Array.from(row.querySelectorAll('td, th'));
+            cells.forEach((cell, idx) => {
+              const txt = cell.textContent?.trim().toLowerCase() || '';
+              const alt = cell.querySelector('img')?.getAttribute('alt')?.toLowerCase() || '';
+              const title = cell.querySelector('img')?.getAttribute('title')?.toLowerCase() || '';
+              
+              const id = NAME_TO_ID[txt] ?? NAME_TO_ID[alt] ?? NAME_TO_ID[title];
+              if (id !== undefined) {
+                uniqueSkillsFound.add(id);
+                if (localSkillColIdx === -1) localSkillColIdx = idx;
+              }
+            });
+          });
+
+          if (uniqueSkillsFound.size > highestScore) {
+            highestScore = uniqueSkillsFound.size;
+            statsTable = table;
+            skillColumnIndex = localSkillColIdx;
           }
         }
-
-        // If no explicit headers, try to score the content
-        if (currentHeaderIndices.skill === -1) {
-            // Assume first column is skill if it matches skill names
-            rows.slice(0, 10).forEach(row => {
-                const firstCell = row.querySelector('td')?.textContent?.trim() || '';
-                if (NAME_TO_ID[firstCell] !== undefined) tableScore++;
-            });
-            if (tableScore > 3) currentHeaderIndices.skill = 0; // Likely first column
-        } else {
-            tableScore = 10; // Found headers, high initial score
-        }
-
-        if (tableScore > highestScore && currentHeaderIndices.skill !== -1) {
-          highestScore = tableScore;
-          bestTable = table;
-          bestHeaderIndices = currentHeaderIndices;
-        }
+      } else {
+        // If we found 'trackertable', still need the skill column index
+        const firstRowCells = Array.from(statsTable.querySelectorAll('tr td, tr th'));
+        skillColumnIndex = firstRowCells.findIndex(cell => {
+           const txt = cell.textContent?.trim().toLowerCase() || '';
+           return NAME_TO_ID[txt] !== undefined || !!cell.querySelector('img');
+        });
+        if (skillColumnIndex === -1) skillColumnIndex = 0; // Default fallback
       }
 
-      if (!bestTable) {
+      if (!statsTable || highestScore < 3 && !doc.getElementById('trackertable')) {
         if (hasUpdateLink) throw new Error('PLAYER_NEEDS_UPDATE');
         throw new Error('CML Table structure not recognized');
       }
 
-      bestTable.querySelectorAll('tr').forEach((row) => {
-        const cols = row.querySelectorAll('td');
-        if (cols.length === 0) return;
+      // 3. Robust Header Detection
+      const allRows = Array.from(statsTable.querySelectorAll('tr'));
+      let headerIndices = { day: -1, week: -1, month: -1, year: -1 };
+
+      // Scan rows for headers
+      for (const row of allRows) {
+        const cells = Array.from(row.querySelectorAll('td, th')).map(c => c.textContent?.trim().toLowerCase() || '');
+        const findCol = (keys: string[]) => cells.findIndex(c => keys.some(k => c === k || c.includes(k)));
         
-        const skillName = cols[bestHeaderIndices.skill]?.textContent?.trim() || '';
-        const skillId = NAME_TO_ID[skillName];
+        const d = findCol(['day', '24h', '1d']);
+        const w = findCol(['week', '7d']);
+        const m = findCol(['month', '30d']);
+        const y = findCol(['year', '365d']);
+
+        if (d !== -1 && d !== skillColumnIndex) headerIndices.day = d;
+        if (w !== -1 && w !== skillColumnIndex) headerIndices.week = w;
+        if (m !== -1 && m !== skillColumnIndex) headerIndices.month = m;
+        if (y !== -1 && y !== skillColumnIndex) headerIndices.year = y;
+
+        if (headerIndices.day !== -1 && headerIndices.week !== -1) break;
+      }
+
+      // Standard CML RS3 relative layout fallback
+      if (headerIndices.day === -1) headerIndices.day = skillColumnIndex + 2;
+      if (headerIndices.week === -1) headerIndices.week = skillColumnIndex + 3;
+      if (headerIndices.month === -1) headerIndices.month = skillColumnIndex + 4;
+      if (headerIndices.year === -1) headerIndices.year = skillColumnIndex + 5;
+
+      // 4. Data Extraction
+      allRows.forEach((row) => {
+        const cols = Array.from(row.querySelectorAll('td, th'));
+        if (cols.length <= skillColumnIndex) return;
+        
+        const cell = cols[skillColumnIndex];
+        const txt = cell.textContent?.trim().toLowerCase() || '';
+        const alt = cell.querySelector('img')?.getAttribute('alt')?.toLowerCase() || '';
+        const title = cell.querySelector('img')?.getAttribute('title')?.toLowerCase() || '';
+        
+        const skillNameKey = [txt, alt, title].find(s => NAME_TO_ID[s] !== undefined);
+        const skillId = skillNameKey ? NAME_TO_ID[skillNameKey] : undefined;
 
         if (skillId !== undefined) {
-          const parseGain = (idx: number) => {
-            if (idx === -1 || !cols[idx]) return 0;
-            const text = cols[idx].textContent || '0';
-            // Clean value: remove commas, pluses, and handle '0' strings
-            const val = parseInt(text.replace(/,/g, '').replace(/\+/g, '').trim());
+          const parseVal = (idx: number) => {
+            if (idx === -1 || idx >= cols.length) return 0;
+            const text = cols[idx].textContent?.trim() || '0';
+            const cleaned = text.replace(/[^-0-9]/g, '');
+            const val = parseInt(cleaned);
+            // CML RS3 often tracks in 0.1 XP increments internally
             return isNaN(val) ? 0 : val * 10;
           };
           
-          if (bestHeaderIndices.day !== -1) results['1d'][skillId] = parseGain(bestHeaderIndices.day);
-          if (bestHeaderIndices.week !== -1) results['7d'][skillId] = parseGain(bestHeaderIndices.week);
-          if (bestHeaderIndices.month !== -1) results['30d'][skillId] = parseGain(bestHeaderIndices.month);
-          if (bestHeaderIndices.year !== -1) results['365d'][skillId] = parseGain(bestHeaderIndices.year);
+          results['1d'][skillId] = parseVal(headerIndices.day);
+          results['7d'][skillId] = parseVal(headerIndices.week);
+          results['30d'][skillId] = parseVal(headerIndices.month);
+          results['365d'][skillId] = parseVal(headerIndices.year);
         }
       });
       
@@ -135,31 +191,25 @@ export const cmlService = {
       return results;
     };
 
-    try {
-      return await tryScrape(PRIMARY_PROXY);
-    } catch (err: any) {
-      if (err.message === 'NOT_TRACKED') {
-        results.error = 'Player not tracked on CML';
-        return results;
-      }
-      if (err.message === 'PLAYER_NEEDS_UPDATE') {
-        results.error = 'Player exists but needs "Update" on CML website';
-        return results;
-      }
-
-      console.warn('Primary CML proxy failed, trying fallback...', err.message);
+    // Sequential retry through proxies
+    for (const proxy of PROXIES) {
       try {
-        return await tryScrape(FALLBACK_PROXY);
-      } catch (fallbackErr: any) {
-        if (fallbackErr.message === 'NOT_TRACKED') {
+        console.log(`CML: Trying proxy ${proxy}`);
+        return await tryScrape(proxy);
+      } catch (err: any) {
+        if (err.message === 'NOT_TRACKED') {
           results.error = 'Player not tracked on CML';
-        } else if (fallbackErr.message === 'PLAYER_NEEDS_UPDATE') {
-          results.error = 'Player exists but needs "Update" on CML website';
-        } else {
-          results.error = 'CML tracking service busy';
+          return results;
         }
-        return results;
+        if (err.message === 'PLAYER_NEEDS_UPDATE') {
+          results.error = 'Player data stale on CML. Click "Update" on CML website.';
+          return results;
+        }
+        console.warn(`CML: Proxy ${proxy} failed: ${err.message}`);
       }
     }
+
+    results.error = 'CML services busy or structure changed.';
+    return results;
   }
 };
